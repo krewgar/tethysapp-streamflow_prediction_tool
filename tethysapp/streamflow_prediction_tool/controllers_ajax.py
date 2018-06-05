@@ -18,6 +18,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import ObjectDeletedError
 import xarray
 
+from .functions import ecmwf_find_most_current_files
+
 # django imports
 from django.contrib.auth.decorators import user_passes_test, login_required
 from django.core.exceptions import PermissionDenied
@@ -400,6 +402,7 @@ def ecmwf_get_avaialable_dates(request):
 @login_required
 @exceptions_to_http_status
 def get_ecmwf_hydrograph_plot(request):
+    print 'ecmwf graph function working***************'
     """
     Retrieves 52 ECMWF ensembles analysis with min., max., avg., std. dev.
     as a plotly hydrograph plot.
@@ -1800,3 +1803,80 @@ def watershed_group_update(request):
     return JsonResponse({
         'success': "Watershed group successfully updated."
     })
+
+
+@require_POST
+@user_passes_test(user_permission_test)
+@exceptions_to_http_status
+def get_ecmwf_forecast_probabilities(request):
+    print 'percent table working#############'
+    """
+    Returns the statistics for the 52 member forecast
+    """
+    path_to_rapid_output = app.get_custom_setting('ecmwf_forecast_folder')
+    if not os.path.exists(path_to_rapid_output):
+        raise SettingsError('Location of ECMWF forecast files faulty. '
+                            'Please check settings.')
+
+    # get/check information from AJAX request
+    get_info = request.GET
+    watershed_name = get_info['watershed']
+    subbasin_name = get_info['subbasin']
+    river_id = get_info['comid']
+
+    forecast_folder = get_info.get('forecast_folder')
+    if not forecast_folder:
+        forecast_folder = 'most_recent'
+    print watershed_name, subbasin_name, river_id, forecast_folder, '%%%%%%%'
+
+    # find/check current output datasets
+    path_to_output_files = \
+        os.path.join(path_to_rapid_output,
+                     "{0}-{1}".format(watershed_name, subbasin_name))
+    forecast_nc_list, start_date = \
+        ecmwf_find_most_current_files(path_to_output_files, forecast_folder)
+    if not forecast_nc_list or not start_date:
+        raise NotFoundError('ECMWF forecast for %s (%s).'
+                            % (watershed_name, subbasin_name))
+    # combine 52 ensembles
+    qout_datasets = []
+    ensemble_index_list = []
+    with rivid_exception_handler("ECMWF Forecast", river_id):
+        for forecast_nc in forecast_nc_list:
+            ensemble_index_list.append(
+                int(os.path.basename(forecast_nc)[:-3].split("_")[-1])
+            )
+            qout_datasets.append(
+                xarray.open_dataset(forecast_nc, autoclose=True)
+                      .sel(rivid=river_id).Qout
+            )
+
+    merged_ds = xarray.concat(qout_datasets,
+                              pd.Index(ensemble_index_list, name='ensemble'))
+
+    returnperiods = {}
+
+    return_period_data = get_return_period_dict(request)
+
+    returnperiods['two'] = float(return_period_data["two"])
+    returnperiods['ten'] = float(return_period_data["ten"])
+    returnperiods['twenty'] = float(return_period_data["twenty"])
+
+    timelist = merged_ds.time.values
+    datelist = []
+    problist = {'two':[],'ten':[],'twenty':[]}
+
+    for timestep in timelist:
+        x = pd.to_datetime(timestep)
+        if str(x.date()) not in datelist:
+            datelist.append(str(x.date()))
+
+    for date in datelist:
+        mergedtime = merged_ds.sel(time=date)
+        for period in returnperiods:
+            retperflow = float(returnperiods[period])
+            probabilities = xarray.where(mergedtime > retperflow, 1, 0).sum(dim='ensemble').astype(float)/51.0*100.
+            probability = probabilities.max().round(2).values
+            problist[period].append((date,np.asscalar(probability)))
+
+    return problist
